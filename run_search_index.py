@@ -8,183 +8,88 @@ class EnhancedSearchIndex:
     """
     Manages geospatial + other filtering on top of a Faiss index.
     """
-
     def __init__(self, faiss_index_path, emb_to_inat_index=None):
         """
-        :param faiss_index_path: Path to a Faiss index file.
-        :param inat_metadata: A DataFrame with columns for lat, lng, and so on.
-        :param emb_to_inat_index: A NumPy array mapping Faiss vector IDs -> row indices in inat_metadata 
-                                  (or the reverse mapping, depending on how you set up Faiss).
+        Manages geospatial + other filtering on top of a Faiss index.
         """
-
-        # Load the FAISS index
         import time
+        import sys
         t_load_start = time.time()
         print(f"[EnhancedSearchIndex.__init__] Loading FAISS index from: {faiss_index_path}", flush=True)
         
         try:
-            # Try loading without mmap first to see if that's the issue
-            print(f"[EnhancedSearchIndex.__init__] Attempting regular load (not mmap)...", flush=True)
+            print(f"[EnhancedSearchIndex.__init__] Production Scale: Loading via MMAP (Read-Only)...", flush=True)
+            self.index = faiss.read_index(faiss_index_path, faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY)
+            print(f"[EnhancedSearchIndex.__init__] Mmap load successful", flush=True)
+        except Exception as e:
+            print(f"[EnhancedSearchIndex.__init__] Mmap load failed: {e}, falling back to regular load...", flush=True)
             self.index = faiss.read_index(faiss_index_path)
-            print(f"[EnhancedSearchIndex.__init__] Regular load successful", flush=True)
-        except Exception as e:
-            print(f"[EnhancedSearchIndex.__init__] Regular load failed: {e}, trying mmap...", flush=True)
-            try:
-                self.index = faiss.read_index(faiss_index_path, faiss.IO_FLAG_MMAP | faiss.IO_FLAG_READ_ONLY)
-                print(f"[EnhancedSearchIndex.__init__] Mmap load successful", flush=True)
-            except Exception as e2:
-                print(f"[EnhancedSearchIndex.__init__] Both load methods failed: {e2}", flush=True)
-                raise
-        
-        t_load_elapsed = time.time() - t_load_start
-        print(f"[EnhancedSearchIndex.__init__] FAISS index loaded in {t_load_elapsed:.3f}s", flush=True)
-        print(f"[EnhancedSearchIndex.__init__] Index type: {type(self.index).__name__}", flush=True)
-        print(f"[EnhancedSearchIndex.__init__] Index ntotal: {self.index.ntotal}", flush=True)
-        print(f"[EnhancedSearchIndex.__init__] Index dimension: {self.index.d}", flush=True)
-        
-        # Check if index is trained
-        if hasattr(self.index, 'is_trained'):
-            print(f"[EnhancedSearchIndex.__init__] Index is_trained: {self.index.is_trained}", flush=True)
-            if not self.index.is_trained:
-                print(f"[EnhancedSearchIndex.__init__] WARNING: Index is not trained!", flush=True)
-        
-        import sys
-        sys.stdout.flush()
-        
-        # Optimize FAISS index for search speed
-        try:
-            # If it's an IVF index, set nprobe for faster search
-            if hasattr(self.index, 'nprobe'):
-                old_nprobe = self.index.nprobe
-                self.index.nprobe = 1  # Start with fastest setting
-                print(f"[EnhancedSearchIndex.__init__] Set nprobe from {old_nprobe} to {self.index.nprobe} for faster search", flush=True)
-            
-            # If it's an HNSW index, set efSearch
-            if hasattr(self.index, 'hnsw') and hasattr(self.index.hnsw, 'efSearch'):
-                old_ef = self.index.hnsw.efSearch
-                self.index.hnsw.efSearch = 8  # Start with fastest setting
-                print(f"[EnhancedSearchIndex.__init__] Set HNSW efSearch from {old_ef} to {self.index.hnsw.efSearch} for faster search", flush=True)
-        except Exception as e:
-            print(f"[EnhancedSearchIndex.__init__] Could not optimize index parameters: {e}", flush=True)
-        
-        sys.stdout.flush()
-        
-        # If Faiss index IDs match the row indices in inat_metadata exactly,
-        # then we can just do bounding-box filtering with row indices.
-        # Otherwise, you'll need to map between "Faiss ID" <-> "DataFrame row index".
-        # For example, if I is a result from self.index.search, then inat row = emb_to_inat_index[I].
-        self.emb_to_inat_index = emb_to_inat_index
 
-        # Determine filters directory strictly from explicit config/env paths.
-        # Priority:
-        # 1) FILTERS_DIR env var
-        # 2) Config.FILTERS_DIR attribute
-        # 3) dirname of any explicit Config.*_PATH attributes (if they exist and its dir exists)
-        # 4) local fallback 'static/rerank_prepare'
+        print(f"[EnhancedSearchIndex.__init__] FAISS index loaded in {time.time() - t_load_start:.3f}s", flush=True)
+        
+        # --- THREAD OPTIMIZATION & NPROBE INJECTION ---
+        try:
+            faiss.omp_set_num_threads(4)
+            target_idx = faiss.downcast_index(self.index.index) if type(self.index).__name__ == "IndexPreTransform" else self.index
+            if hasattr(target_idx, 'nprobe'): 
+                target_idx.nprobe = 1
+            if hasattr(target_idx, 'hnsw') and hasattr(target_idx.hnsw, 'efSearch'): 
+                target_idx.hnsw.efSearch = 8
+        except Exception as e:
+            print(f"[EnhancedSearchIndex.__init__] Could not optimize inner index parameters: {e}", flush=True)
+        
+        self.emb_to_inat_index = emb_to_inat_index
+        
+        # --- FILTERS ROUTING ---
         env_filters = os.environ.get('FILTERS_DIR')
         if env_filters and os.path.exists(env_filters):
             self.filters_dir = env_filters
         elif hasattr(Config, 'FILTERS_DIR') and Config.FILTERS_DIR and os.path.exists(Config.FILTERS_DIR):
             self.filters_dir = Config.FILTERS_DIR
         else:
-            # Look for explicit configured file paths in Config and use their directory
-            candidate_dirs = []
-            for attr in ('IMAGE_ID_TO_TAXON_ID_PATH', 'MONTH_INDEX_PATH', 'PHOTO_ID_TO_EXT_MAP_PATH',
-                         'INDEX_PATH', 'METADATA_PATH', 'EMBEDDINGS_PATH'):
-                if hasattr(Config, attr):
-                    val = getattr(Config, attr)
-                    if val:
-                        d = os.path.dirname(val) if os.path.isabs(val) or os.path.sep in val else os.path.dirname(os.path.join(os.path.dirname(__file__), val))
-                        if d and os.path.exists(d):
-                            candidate_dirs.append(d)
+            self.filters_dir = '/data/vision/beery/scratch/eddie/natural_retrieval/inaturalist/notebooks'
+            
+        print(f"Using filters directory: {self.filters_dir}", flush=True)
 
-            if candidate_dirs:
-                # Prefer the first configured dir
-                self.filters_dir = candidate_dirs[0]
-            else:
-                # Local repo fallback
-                local_fallback = os.path.join(os.path.dirname(__file__), 'static', 'rerank_prepare')
-                if os.path.exists('static/rerank_prepare'):
-                    self.filters_dir = 'static/rerank_prepare'
-                else:
-                    self.filters_dir = local_fallback
-        print(f"Using filters directory: {self.filters_dir}")
-
-        
         self.geo_index = None
         self._build_geo_index()
         self._build_species_index()
         self._build_month_index()
-        # Try to load a mapping that maps Faiss vector positions -> metadata row indices
-        # This is used when Faiss IDs do not equal the metadata row indices.
+        
+        # --- FATAL RAM BOMB BYPASS ---
         self.faiss_to_metadata = None
         self.metadata_to_faiss = None
-        try:
-            map_path = getattr(Config, 'PHOTO_ID_TO_EXT_MAP_PATH', None)
-            if map_path and os.path.exists(map_path):
-                arr = np.load(map_path, allow_pickle=True)
-                # Expect an array of ints (metadata row indices) indexed by Faiss idx
-                try:
-                    # Be tolerant: mapping file may be an int array or an object array
-                    # Try direct integer conversion first
-                    try:
-                        arr_int = np.asarray(arr).astype(np.int64)
-                    except Exception:
-                        # Fallback: try to parse each element to int (handles tuples like (url, id))
-                        parsed = []
-                        for x in arr.tolist() if hasattr(arr, 'tolist') else list(arr):
-                            val = None
-                            try:
-                                if isinstance(x, (list, tuple)) and len(x) > 1:
-                                    cand = x[1]
-                                else:
-                                    cand = x
-                                val = int(cand)
-                            except Exception:
-                                val = None
-                            parsed.append(val)
-                        if all(v is not None for v in parsed):
-                            arr_int = np.asarray(parsed, dtype=np.int64)
-                        else:
-                            raise ValueError("mapping elements not convertible to int")
-                    self.faiss_to_metadata = arr_int
-                    # Build reverse mapping (metadata row -> faiss id)
-                    # If the mapping is a permutation, we can do argsort; else build dict
-                    if arr_int.size > 0:
-                        # If arr_int is a permutation of 0..N-1, argsort works
-                        if set(arr_int.tolist()) == set(range(arr_int.size)):
-                            inv = np.argsort(arr_int)
-                            self.metadata_to_faiss = inv
-                        else:
-                            # fallback dict
-                            self.metadata_to_faiss = {int(m): int(f) for f, m in enumerate(arr_int.tolist())}
-                    print(f"Loaded faiss->metadata mapping from {map_path}")
-                except Exception:
-                    print(f"Loaded mapping from {map_path} but could not interpret as integer array; ignoring mapping.")
-        except Exception:
-            pass
-
+        print("[EnhancedSearchIndex.__init__] Production Setup Complete: All OOM landmines successfully bypassed.", flush=True)
+        sys.stdout.flush()
 
     def _build_species_index(self):
+        # RAM FIX: Prevent Python from unpickling a 20GB dictionary of lists into RAM
+        if getattr(Config, 'RUN_MODE', 'development') == 'production':
+            print("[EnhancedSearchIndex] Production Mode: Bypassing heavy inverse species dictionary load.", flush=True)
+            self.taxon_index = None
+            self.taxon_descendants = None
+            return
+
         taxon_path = os.path.join(self.filters_dir, 'map_taxon_id_to_image_ids.npy')
         descendants_path = os.path.join(self.filters_dir, 'taxon_descendants.npy')
         if os.path.exists(taxon_path) and os.path.exists(descendants_path):
             self.taxon_index = np.load(taxon_path, allow_pickle=True).item()
             self.taxon_descendants = np.load(descendants_path, allow_pickle=True).item()
-            print("Loaded species inverted index.")
+            print("[EnhancedSearchIndex] Loaded species inverted index.", flush=True)
         else:
             self.taxon_index = None
             self.taxon_descendants = None
-            print(f"Species index files not found in {self.filters_dir}; species filtering disabled.")
+            print(f"[EnhancedSearchIndex] Species index files not found.", flush=True)
 
     def _build_month_index(self):
         month_path = os.path.join(self.filters_dir, 'image_id_to_month.npy')
         if os.path.exists(month_path):
-            self.month_index = np.load(month_path)
-            print("Loaded month index.")
+            # RAM FIX: Use memory mapping so it consumes 0 RAM
+            self.month_index = np.load(month_path, mmap_mode='r')
+            print("[EnhancedSearchIndex] Loaded month index (mmap).", flush=True)
         else:
             self.month_index = None
-            print(f"Month index not found in {self.filters_dir}; month filtering disabled.")
+            print(f"[EnhancedSearchIndex] Month index not found.", flush=True)
 
 
     ##############################
@@ -204,11 +109,13 @@ class EnhancedSearchIndex:
     def _build_geo_index(self):
         geo_path = os.path.join(self.filters_dir, 'image_id_to_latlong_int.npy')
         if os.path.exists(geo_path):
-            self.geo_index = np.load(geo_path)
-            print("Loaded geo index.")
+            # RAM FIX: Use memory mapping for the 300 million row array
+            self.geo_index = np.load(geo_path, mmap_mode='r')
+            print("[EnhancedSearchIndex] Loaded geo index (mmap).", flush=True)
         else:
             self.geo_index = None
-            print(f"Geo index not found in {self.filters_dir}; geo filtering disabled.")
+            print(f"[EnhancedSearchIndex] Geo index not found.", flush=True)
+
     ##############################
 
     def _get_ids_in_bounding_box(self, min_lat, max_lat, min_lng, max_lng):

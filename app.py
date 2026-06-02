@@ -1,5 +1,16 @@
 import os
 
+# Ensure Hugging Face caches are placed in a writable local folder instead of a home directory that may be mounted read-only.
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_TRANSFORMERS_CACHE = os.path.join(PROJECT_ROOT, ".cache", "huggingface")
+if not os.environ.get("TRANSFORMERS_CACHE"):
+    os.environ["TRANSFORMERS_CACHE"] = DEFAULT_TRANSFORMERS_CACHE
+if not os.environ.get("HUGGINGFACE_HUB_CACHE"):
+    os.environ["HUGGINGFACE_HUB_CACHE"] = DEFAULT_TRANSFORMERS_CACHE
+if not os.environ.get("HF_HOME"):
+    os.environ["HF_HOME"] = DEFAULT_TRANSFORMERS_CACHE
+os.makedirs(DEFAULT_TRANSFORMERS_CACHE, exist_ok=True)
+
 # macOS workaround: Set KMP_DUPLICATE_LIB_OK to avoid OpenMP duplicate library errors
 try:
     if os.uname().sysname == 'Darwin' and os.environ.get('KMP_DUPLICATE_LIB_OK', '').lower() not in ('true', '1', 'yes'):
@@ -26,6 +37,22 @@ from all_clip import load_clip
 from services.search_service import SearchService
 from config import Config
 
+
+import numpy as np
+
+def make_serializable(obj):
+    """Recursively converts numpy data types into native Python types for JSON transfer."""
+    if isinstance(obj, dict):
+        return {k: make_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [make_serializable(v) for v in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return make_serializable(obj.tolist())
+    return obj
 
 # Initialize the Flask application
 app = Flask(__name__)
@@ -212,16 +239,17 @@ def process_query():
     print(f"[process_query] First 3 species: {results.get('species', [])[:3]}", flush=True)
     print(f"[process_query] Non-empty species: {sum(1 for s in results.get('species', []) if s)}", flush=True)
 
-    # Return results
+    safe_results = make_serializable(results)
+
     return jsonify(
-        img_ids=results['id'],
-        img_urls=results['img_url'],
-        img_names=results['file_name'],
-        retrieval_scores=results['scores'],
-        species=results['species'],
-        latitudes=results['latitudes'],
-        longitudes=results['longitudes'],
-        months=results['months'],
+        img_ids=safe_results['id'],
+        img_urls=safe_results['img_url'],
+        img_names=safe_results['file_name'],
+        retrieval_scores=safe_results['scores'],
+        species=safe_results['species'],
+        latitudes=safe_results['latitudes'],
+        longitudes=safe_results['longitudes'],
+        months=safe_results['months'],
     )
 
 
