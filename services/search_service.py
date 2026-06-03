@@ -7,7 +7,13 @@ import pandas as pd
 
 class SearchService:
     def __init__(self):
-        self.embeddings = EmbeddingProvider(Config.EMBEDDINGS_PATH)
+        # Safely check if the embedding path exists and is not None before loading
+        if getattr(Config, 'EMBEDDINGS_PATH', None) is not None:
+            print(f"[SearchService.__init__] Loading embeddings from: {Config.EMBEDDINGS_PATH}", flush=True)
+            self.embeddings = EmbeddingProvider(Config.EMBEDDINGS_PATH)
+        else:
+            print("[SearchService.__init__] No EMBEDDINGS_PATH configured, skipping embedding load", flush=True)
+            self.embeddings = None
         self.meta = MemoryMappedMetadataProvider(Config.METADATA_PATH)
         # Load photo id -> extension mapping. Prefer JSON if available because
         # some environments produce pickled .npy files that may not unpickle
