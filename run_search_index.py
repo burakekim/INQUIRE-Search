@@ -2,7 +2,15 @@ import numpy as np
 import faiss
 from flask import Flask, request, jsonify
 import os
+import threading
 from config import Config
+
+# The pool size of the request currently being served, kept per-thread. app.py runs each search in
+# a ThreadPoolExecutor with max_workers=2, so two searches can be in flight at once; a single shared
+# attribute on the index let one request's pool size be read by the other (E43 -- an unfiltered
+# request would reset it to None and the filtered request that asked for it logged None).
+_TLS = threading.local()
+
 
 class EnhancedSearchIndex:
     """
@@ -28,13 +36,49 @@ class EnhancedSearchIndex:
         print(f"[EnhancedSearchIndex.__init__] FAISS index loaded in {time.time() - t_load_start:.3f}s", flush=True)
         
         # --- THREAD OPTIMIZATION & NPROBE INJECTION ---
+        # E48: efSearch belongs to the COARSE QUANTIZER, not to the IVF index. This block used to
+        # write `target_idx.hnsw.efSearch = 8` on the IndexIVFPQ, which has no `.hnsw` at all, so
+        # the guard was never true and the assignment never happened -- the value stored in the
+        # index file (1034) was what ran. Measured before changing anything
+        # (ablations/E48_efsearch.py, 264 benchmark queries, cell recall against the exact top-256
+        # centroids by brute force):
+        #
+        #     efSearch     cells returned (asked 256)   cell recall@256   coarse ms/query
+        #            8                            228             39.0%              0.58
+        #          256                            256             97.8%              0.12
+        #         1034 (the accident)             256             99.8%              0.58
+        #         2048                            256            100.0%              1.29
+        #
+        # So the intended 8 would have been actively harmful: the quantizer cannot even fill the
+        # request, returning 228 cells when asked for 256, and 39% of those are the wrong cells.
+        # (Note it does NOT silently lift efSearch to k -- measured, not assumed.)
+        #
+        # 2048 is set DELIBERATELY, and the reason is not headroom: it is the smallest tested value
+        # reaching 100.0% cell recall, which takes the coarse quantizer out of consideration
+        # entirely as a source of retrieval error so nobody has to reason about it again. It costs
+        # 0.7 ms on a ~1 s query. Secondarily, cell recall was only measured at the deployed
+        # nprobe=256, and 2048 is cheap insurance if anyone raises nprobe later.
+        #
+        # Setting it here rather than relying on the file also means an index rebuild cannot
+        # silently change it back: the stored 1034 is now overridden on every load.
+        COARSE_EF_SEARCH = 2048
         try:
             faiss.omp_set_num_threads(4)
             target_idx = faiss.downcast_index(self.index.index) if type(self.index).__name__ == "IndexPreTransform" else self.index
-            if hasattr(target_idx, 'nprobe'): 
+            if hasattr(target_idx, 'nprobe'):
                 target_idx.nprobe = 1
-            if hasattr(target_idx, 'hnsw') and hasattr(target_idx.hnsw, 'efSearch'): 
-                target_idx.hnsw.efSearch = 8
+            quantizer = None
+            if hasattr(target_idx, 'quantizer'):
+                quantizer = faiss.downcast_index(target_idx.quantizer)
+            if quantizer is not None and hasattr(quantizer, 'hnsw'):
+                was = quantizer.hnsw.efSearch
+                quantizer.hnsw.efSearch = COARSE_EF_SEARCH
+                print(f"[EnhancedSearchIndex.__init__] coarse quantizer "
+                      f"{type(quantizer).__name__}: efSearch {was} -> {quantizer.hnsw.efSearch} "
+                      f"(E48; deliberate, see comment)", flush=True)
+            else:
+                print(f"[EnhancedSearchIndex.__init__] coarse quantizer has no HNSW; "
+                      f"efSearch not applicable.", flush=True)
         except Exception as e:
             print(f"[EnhancedSearchIndex.__init__] Could not optimize inner index parameters: {e}", flush=True)
         
@@ -55,6 +99,7 @@ class EnhancedSearchIndex:
         self._build_geo_index()
         self._build_species_index()
         self._build_month_index()
+        self._build_license_index()
         
         # --- FATAL RAM BOMB BYPASS ---
         self.faiss_to_metadata = None
@@ -63,23 +108,47 @@ class EnhancedSearchIndex:
         sys.stdout.flush()
 
     def _build_species_index(self):
-        # RAM FIX: Prevent Python from unpickling a 20GB dictionary of lists into RAM
+        # RAM FIX: Prevent Python from unpickling a 20GB dictionary of lists into RAM.
+        # In production we instead mmap the FORWARD per-image taxon array (image_id_to_taxon_id.npy,
+        # ~1.2GB, row idx == FAISS id) and compute the id subset per query on the fly (like the geo
+        # filter does), so the in-index IDSelector species filter works without the 20GB reverse dict.
+        self.image_taxon_index = None
+        forward_path = os.path.join(self.filters_dir, 'image_id_to_taxon_id.npy')
+        if os.path.exists(forward_path):
+            self.image_taxon_index = np.load(forward_path, mmap_mode='r')
+            print(f"[EnhancedSearchIndex] Loaded forward taxon array (mmap): {self.image_taxon_index.shape}", flush=True)
+        else:
+            print(f"[EnhancedSearchIndex] Forward taxon array not found at {forward_path}.", flush=True)
+
+        # E47: the descendants map is loaded in production too. The RAM bomb this bypass exists for
+        # is `map_taxon_id_to_image_ids.npy` -- 886 MB on disk that unpickles to ~20 GB of Python
+        # lists -- but `taxon_descendants.npy` is a separate 2.6 MB file (38,039 keys, ~1.3 MB in
+        # RAM, 0.24 s to load) that was only skipped because both were loaded behind one `if`.
+        # Dropping it made the production filter species-exact, so it could not see the 83,504
+        # subspecies iNat files beside its species -- which is 673 of the 683 confirming photos the
+        # filter was blind to (E46 Phase 0b). The feature was dead, not missing.
+        descendants_path = os.path.join(self.filters_dir, 'taxon_descendants.npy')
+        self.taxon_descendants = None
+        if os.path.exists(descendants_path):
+            self.taxon_descendants = np.load(descendants_path, allow_pickle=True).item()
+            print(f"[EnhancedSearchIndex] Loaded taxon descendants map "
+                  f"({len(self.taxon_descendants):,} taxa).", flush=True)
+        else:
+            print(f"[EnhancedSearchIndex] Taxon descendants map not found at {descendants_path}; "
+                  f"species filtering will be exact-rank only.", flush=True)
+
         if getattr(Config, 'RUN_MODE', 'development') == 'production':
             print("[EnhancedSearchIndex] Production Mode: Bypassing heavy inverse species dictionary load.", flush=True)
             self.taxon_index = None
-            self.taxon_descendants = None
             return
 
         taxon_path = os.path.join(self.filters_dir, 'map_taxon_id_to_image_ids.npy')
-        descendants_path = os.path.join(self.filters_dir, 'taxon_descendants.npy')
-        if os.path.exists(taxon_path) and os.path.exists(descendants_path):
+        if os.path.exists(taxon_path):
             self.taxon_index = np.load(taxon_path, allow_pickle=True).item()
-            self.taxon_descendants = np.load(descendants_path, allow_pickle=True).item()
             print("[EnhancedSearchIndex] Loaded species inverted index.", flush=True)
         else:
             self.taxon_index = None
-            self.taxon_descendants = None
-            print(f"[EnhancedSearchIndex] Species index files not found.", flush=True)
+            print(f"[EnhancedSearchIndex] Species inverted index not found.", flush=True)
 
     def _build_month_index(self):
         month_path = os.path.join(self.filters_dir, 'image_id_to_month.npy')
@@ -90,6 +159,25 @@ class EnhancedSearchIndex:
         else:
             self.month_index = None
             print(f"[EnhancedSearchIndex] Month index not found.", flush=True)
+
+    def _build_license_index(self):
+        # Built via backend/build_license_index.py; lives outside filters_dir
+        # (which points at a colleague's shared directory).
+        license_path = getattr(Config, 'LICENSE_INDEX_PATH', None)
+        code_map_path = getattr(Config, 'LICENSE_CODE_MAP_PATH', None)
+        self.license_index = None
+        self.license_name_to_code = {}
+        if license_path and os.path.exists(license_path):
+            # RAM FIX: Use memory mapping so it consumes 0 RAM
+            self.license_index = np.load(license_path, mmap_mode='r')
+            print("[EnhancedSearchIndex] Loaded license index (mmap).", flush=True)
+        else:
+            print(f"[EnhancedSearchIndex] License index not found.", flush=True)
+        if code_map_path and os.path.exists(code_map_path):
+            import json
+            with open(code_map_path, 'r') as f:
+                code_to_name = {int(k): v for k, v in json.load(f).items()}
+            self.license_name_to_code = {v: k for k, v in code_to_name.items()}
 
 
     ##############################
@@ -142,6 +230,28 @@ class EnhancedSearchIndex:
 
         print(f"[geo] Found {len(subset_ids)} images in bounding box")
         return subset_ids
+
+    def _bbox_mask_for_ids(self, ids, min_lat, max_lat, min_lng, max_lng):
+        """The SAME bounding-box predicate as `_get_ids_in_bounding_box`, applied to a subset of
+        rows instead of to all 300M of them (E47).
+
+        `_get_ids_in_bounding_box` builds the full in-box id array (161M ids for the North-America
+        box) and the caller then intersects it with a much smaller species subset. Intersection
+        commutes, so `intersect1d(all_in_box, ids) == ids[predicate(ids)]` exactly -- both are the
+        rows of `ids` that satisfy the predicate, and `ids` arrives sorted and unique from
+        `np.flatnonzero`, so the result stays sorted and unique too. Doing it this way reads
+        len(ids) rows of the geo mmap rather than 300M, which is the whole ~25 s cost.
+        """
+        ids = np.asarray(ids, dtype=np.int64)
+        if len(ids) == 0:
+            return ids
+        min_lat_enc, min_lon_enc = self._encode_lat_lon(min_lat, min_lng)
+        max_lat_enc, max_lon_enc = self._encode_lat_lon(max_lat, max_lng)
+        sub = np.asarray(self.geo_index[ids])
+        lats, lons = sub[:, 0], sub[:, 1]
+        keep = ((lats >= min_lat_enc) & (lats <= max_lat_enc) &
+                (lons >= min_lon_enc) & (lons <= max_lon_enc))
+        return ids[keep]
 
     def _is_hnsw_index(self):
         """Return True if the loaded Faiss index is an HNSW-style index."""
@@ -418,25 +528,64 @@ class EnhancedSearchIndex:
         return D, I
     
 
-    def _get_ids_in_species(self, taxon_id):
+    def _get_ids_in_species(self, taxon_id, expand_descendants=False):
         """
         Return the 'row indices' (which must match the Faiss ID or be mappable to the Faiss ID)
-        for images with the given species.
+        for images with the given species. `taxon_id` may be a single id or a list/array of ids
+        (OR match, e.g. predator OR prey).
+
+        Two backends: the reverse dict (self.taxon_index, dev only) or, in production, the forward
+        mmap array (self.image_taxon_index) scanned on the fly. **Both CAN expand descendants**
+        (E47) so the two paths agree when asked; before, only the dev path did, which made the
+        deployed filter species-exact and blind to the subspecies iNat actually labels the photo
+        with.
+
+        Expansion is DOWNWARD ONLY -- a species plus its subspecies, never up to genus or family.
+        Dilution is monotone in pool size (E46: 51k photos -> 60 edges, 21.5M -> 51), so widening
+        upward is precisely the mechanism that made the 717-species scope lose.
+
+        **Default False (E48).** Exact-rank is what the deployed filter has always done, and the
+        randomized retrieval condition's species-scope arm must keep meaning what E46 measured while
+        it collects its first observations -- see the note at
+        backend/services/search_service.py:193. Pass expand_descendants=True to opt in per request.
         """
         import time
         t_start = time.time()
-        
-        # Collect all arrays first, then concatenate once (much faster than extend in loop)
-        arrays_to_concat = [np.asarray(self.taxon_index[taxon_id])]
-        
-        for descendant_taxon_id in self.taxon_descendants[taxon_id]:
-            arrays_to_concat.append(np.asarray(self.taxon_index[descendant_taxon_id]))
-        
-        # Single concatenate is much faster than repeated list extends
-        subset_ids = np.concatenate(arrays_to_concat) if len(arrays_to_concat) > 1 else arrays_to_concat[0]
-        
+
+        taxon_ids = taxon_id if isinstance(taxon_id, (list, tuple, np.ndarray, set)) else [taxon_id]
+        taxon_ids = [int(t) for t in taxon_ids]
+
+        n_asked = len(taxon_ids)
+        if expand_descendants and self.taxon_descendants:
+            expanded = set(taxon_ids)
+            for tid in taxon_ids:
+                expanded.update(int(d) for d in self.taxon_descendants.get(tid, ()))
+            taxon_ids = sorted(expanded)
+
+        if self.taxon_index is not None:
+            # descendants are already folded into taxon_ids above, so this walks one flat list
+            # rather than nesting a second descendant loop inside it
+            arrays_to_concat = [np.asarray(self.taxon_index[tid])
+                                for tid in taxon_ids if tid in self.taxon_index]
+            subset_ids = (np.unique(np.concatenate(arrays_to_concat)) if arrays_to_concat
+                          else np.array([], dtype=np.int64))
+        elif self.image_taxon_index is not None:
+            # On-the-fly scan of the forward array (row idx == FAISS id), like the geo filter.
+            # The array is 300M rows but the index only has ntotal (~289M) vectors -- the trailing
+            # rows are unindexed padding (all zeros), so real taxon ids never match there, but clip
+            # to < ntotal defensively so no out-of-range id ever reaches the IDSelector.
+            mask = np.isin(self.image_taxon_index, taxon_ids)
+            subset_ids = np.flatnonzero(mask)
+            ntotal = getattr(self.index, "ntotal", None)
+            if ntotal is not None:
+                subset_ids = subset_ids[subset_ids < ntotal]
+        else:
+            raise ValueError("No taxon index available (neither reverse dict nor forward array).")
+
         t_elapsed = time.time() - t_start
-        print(f"[species] Found {len(subset_ids)} images with taxon_id {taxon_id} in {t_elapsed:.3f}s", flush=True)
+        print(f"[species] Found {len(subset_ids)} images for {n_asked} requested taxa "
+              f"(+{len(taxon_ids) - n_asked} descendants, expand={expand_descendants}) "
+              f"in {t_elapsed:.3f}s", flush=True)
         return subset_ids
     
     def search_with_species_filter(self, query_vec, k, taxon_id, nprobe=1):
@@ -502,15 +651,23 @@ class EnhancedSearchIndex:
         return D, I
     
 
-    def search_with_filters(self, query_vec, k, geo_filter=None, taxon_id=None, months=None, nprobe=1):
+    @property
+    def last_filter_pool_size(self):
+        """Candidate-pool size of the search this thread just ran, or None if it was unfiltered.
+        Read by SearchService.search to report `filter_pool_size` to the caller."""
+        return getattr(_TLS, 'pool_size', None)
+
+    def search_with_filters(self, query_vec, k, geo_filter=None, taxon_id=None, months=None,
+                            licenses=None, nprobe=1, expand_descendants=False):
         """
         Perform KNN search restricted to images in the bounding box.
-        
+
         :param query_vec: A NumPy array of shape (1, d) or (d,) containing the query embedding.
         :param k: Number of nearest neighbors.
         :param geo_filter (optional): bounding box coordinate tuple (min_lat, max_lat, min_lng, max_lng)
         :param taxon_id (optional): species ID
         :param months (optional): list of months (numbered 1-12) to filter by
+        :param licenses (optional): list of license codes (ints, from Config.LICENSE_CODE_MAP_PATH) to filter by
         :param nprobe: number of IVF probes (i.e. search strength)
         :return: (D, I) where D are distances, I are Faiss IDs.
         """
@@ -522,18 +679,22 @@ class EnhancedSearchIndex:
 
         subset_ids = None
 
+        # E47: species FIRST, then the bounding box applied to what survives. The old order built
+        # the full 161M-id in-box array and then intersected it down to a ~50k species subset,
+        # paying ~25 s for a pool three orders of magnitude smaller. Intersection commutes, so the
+        # id set is unchanged (see _bbox_mask_for_ids); only the cost changes. A geo-only request
+        # still has to scan, because there is nothing to narrow it with first.
+        if taxon_id is not None:
+            subset_ids = self._get_ids_in_species(taxon_id, expand_descendants)
+            print("[filter] Have ", len(subset_ids), "images in filter after taxon filter.", flush=True)
+
         if geo_filter is not None:
             min_lat, max_lat, min_lng, max_lng = geo_filter
-            subset_ids = self._get_ids_in_bounding_box(min_lat, max_lat, min_lng, max_lng)
-            print("[filter] Have ", len(subset_ids), "images in filter after geo filter.", flush=True)
-            
-        if taxon_id is not None: # combine geo and taxon_id if needed
-            taxon_subset_ids = self._get_ids_in_species(taxon_id)
             if subset_ids is None:
-                subset_ids = taxon_subset_ids
+                subset_ids = self._get_ids_in_bounding_box(min_lat, max_lat, min_lng, max_lng)
             else:
-                subset_ids = np.intersect1d(subset_ids, taxon_subset_ids)
-            print("[filter] Have ", len(subset_ids), "images in filter after taxon filter.", flush=True)
+                subset_ids = self._bbox_mask_for_ids(subset_ids, min_lat, max_lat, min_lng, max_lng)
+            print("[filter] Have ", len(subset_ids), "images in filter after geo filter.", flush=True)
 
         # Apply month filtering. Previously this only ran when subset_ids was
         # already populated (from geo or taxon filters). That made "month-only"
@@ -566,6 +727,23 @@ class EnhancedSearchIndex:
         #         subset_ids = month_subset_ids
         #     else:
         #         subset_ids = np.intersect1d(subset_ids, month_subset_ids)
+
+        # Apply license filtering, same shape as the month-filter block above.
+        if licenses is not None:
+            if self.license_index is None:
+                print("License filter provided but license index not available; ignoring licenses.", flush=True)
+            else:
+                if subset_ids is None:
+                    license_subset = np.where(np.isin(self.license_index, licenses))[0]
+                    subset_ids = license_subset
+                    print("[filter] Have ", len(subset_ids), "images in filter after license-only filter.", flush=True)
+                else:
+                    subset_ids = subset_ids[np.isin(self.license_index[subset_ids], licenses)]
+                    print("[filter] Have ", len(subset_ids), "images in filter after license filter.", flush=True)
+
+        # Size of the candidate pool this request actually searched, so a draw can be logged with
+        # it (E37 Phase 5). None when the request was unfiltered.
+        _TLS.pool_size = None if subset_ids is None else int(len(subset_ids))
 
         if subset_ids is not None:
             if len(subset_ids) == 0:
@@ -604,6 +782,20 @@ class EnhancedSearchIndex:
             sys.stdout.flush()
             return result
         else:
+            # No id subset. Honor a raised nprobe here too (the §3.32 CONTROL: unfiltered search
+            # at high nprobe, to isolate whether the in-index win is species filtering vs just
+            # scanning more IVF cells). nprobe=1 keeps the original fast unfiltered default.
+            if nprobe and nprobe != 1:
+                print(f"[search_with_filters] No filters, unfiltered search at nprobe={nprobe}", flush=True)
+                sys.stdout.flush()
+                try:
+                    faiss.omp_set_num_threads(1)
+                except Exception:
+                    pass
+                if query_vec.ndim == 1:
+                    query_vec = query_vec.reshape(1, -1)
+                params = faiss.SearchParametersIVF(nprobe=nprobe)
+                return self.index.search(query_vec, k, params=params)
             print("[search_with_filters] No filters applied, using unfiltered search", flush=True)
             sys.stdout.flush()
             return self.search(query_vec, k)
@@ -743,8 +935,10 @@ def run_search_service():
         taxon_id = data.get("taxon_id", None)
         geo_filter = data.get("geo_filter", None)
         month_filter = data.get("month_filter", None)
+        license_filter = data.get("license_filter", None)
         D, I = enhanced_index.search_with_filters(query_vec, k, geo_filter=geo_filter,
-                                                  taxon_id=taxon_id, months=month_filter)
+                                                  taxon_id=taxon_id, months=month_filter,
+                                                  licenses=license_filter)
         return jsonify({"distances": D.tolist(), "indices": I.tolist()})
     
     # Initialize enhanced_index here:

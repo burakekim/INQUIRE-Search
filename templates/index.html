@@ -25,8 +25,15 @@
                     <input type="text" id="user-input" placeholder="E.g. [species] involved in [concept]">
                     <button type="submit" id="search-button" onclick="clickSearch()" disabled title="Type a query"> <i class="fas fa-arrow-right"></i></button>
                 </div>
-                
-    
+
+                <!-- License filter: restrict results to images with a reusable license -->
+                <div id="license-filter-container">
+                    <button type="button" id="license-filter-toggle">Filter by license &#9662;</button>
+                    <div id="license-filter-options" style="display: none;">
+                        <!-- Checkboxes populated from /api/license_options -->
+                    </div>
+                </div>
+
             </form>
             <div id="data-submission">
                  <!-- Selected Image Counter -->        
@@ -139,6 +146,30 @@
                 instructionsModal.style.display = 'block';
             });
 
+            // License filter panel: fetch available license types and render checkboxes
+            const licenseToggle = document.getElementById('license-filter-toggle');
+            const licenseOptionsContainer = document.getElementById('license-filter-options');
+            licenseToggle.addEventListener('click', function () {
+                licenseOptionsContainer.style.display =
+                    licenseOptionsContainer.style.display === 'none' ? 'block' : 'none';
+            });
+            $.get('/api/license_options', function (data) {
+                const licenses = data.licenses || [];
+                licenses.forEach(function (license) {
+                    const label = document.createElement('label');
+                    label.className = 'license-option';
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.className = 'license-checkbox';
+                    checkbox.value = license;
+                    label.appendChild(checkbox);
+                    // "Unknown" covers photos with no recorded license — off by
+                    // default, since those aren't necessarily reusable.
+                    label.appendChild(document.createTextNode(' ' + license));
+                    licenseOptionsContainer.appendChild(label);
+                });
+            });
+
             closeButton.addEventListener('click', function () {
                 instructionsModal.style.display = 'none';
             });
@@ -182,7 +213,7 @@
     
         
         // function to create each image object
-        function createImage(img_id,src,retrieval_score) {
+        function createImage(img_id,src,retrieval_score,license) {
             const imageDiv = document.createElement('div');
             imageDiv.className = 'selected-image';
 
@@ -206,6 +237,28 @@
 
             // add new image to the div
             imageDiv.appendChild(image);
+
+            // iNat photo id + link, so collaborators can trace each retrieval
+            // back to the source image on iNaturalist.
+            const caption = document.createElement('div');
+            caption.className = 'inat-caption';
+            const link = document.createElement('a');
+            link.href = 'https://www.inaturalist.org/photos/' + String(img_id);
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            link.textContent = 'iNat #' + String(img_id);
+            // keep clicks on the link from also toggling image selection
+            link.addEventListener('click', function (e) { e.stopPropagation(); });
+            caption.appendChild(link);
+
+            // license label, so users can see what they're allowed to reuse
+            const licenseLabel = document.createElement('span');
+            licenseLabel.className = 'inat-license';
+            licenseLabel.textContent = 'License: ' + (license || 'Unknown');
+            caption.appendChild(licenseLabel);
+
+            imageDiv.appendChild(caption);
+
             return imageDiv;
         }
 
@@ -419,7 +472,8 @@
             console.log('end'+endIndex)
             const imageContainer = document.getElementById('image-results');
             for (let i = currentImageIndex; i < endIndex; i++) {
-                const img = createImage(imageData.img_ids[i], imageData.img_urls[i],imageData.retrieval_scores[i]) // Adjust based on your image data structure
+                const license = imageData.licenses ? imageData.licenses[i] : null;
+                const img = createImage(imageData.img_ids[i], imageData.img_urls[i],imageData.retrieval_scores[i],license) // Adjust based on your image data structure
                 imageContainer.appendChild(img)
             }
 
@@ -433,12 +487,21 @@
         const imagesPerPage = 40; // Number of images to display per page
         var imageCount = 200; // total images to fetch retrievals for
         // code to call process_query python code with the given input, returning images for display and annotation
+        // Read the checked license checkboxes into a {licenses: [...]} filters object.
+        // Returns {} (no filter) if none are checked, so unfiltered search is unaffected.
+        function getSelectedFilters() {
+            const selectedLicenses = Array.from(document.querySelectorAll('.license-checkbox:checked'))
+                .map(function (cb) { return cb.value; });
+            return selectedLicenses.length > 0 ? { licenses: selectedLicenses } : {};
+        }
+
         $(document).ready(function() {
             $("#query-form").submit(function(e) {
                 e.preventDefault();
                 var userQuery = $("#user-input").val();
-               
-                $.post("/process_query", { user_input: userQuery, image_count: imageCount }, function(data) {
+                var filters = JSON.stringify(getSelectedFilters());
+
+                $.post("/process_query", { user_input: userQuery, image_count: imageCount, filters: filters }, function(data) {
                     imageData = data  //.img_urls; // Assuming data.img_urls is an array of { img_id, img_url }
                     currentImageIndex = 0; // Reset the index
                     $("#image-results").empty();

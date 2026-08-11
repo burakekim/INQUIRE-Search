@@ -161,6 +161,13 @@ def device_info():
     })
 
 
+@app.route('/api/license_options', methods=['GET'])
+def license_options():
+    """License codes present in the index, for populating the license filter UI."""
+    names = sorted(set(search_service.license_code_to_name.values()))
+    return jsonify(licenses=names)
+
+
 @app.route('/login', methods=['POST'])
 @session_id_required
 def login_request():
@@ -172,6 +179,26 @@ def login_request():
         return redirect("/", code=302)
     else:
         return render_template('login.html', error='Incorrect key.')
+
+
+def _run_search(embedding, k, filters, label, timeout=120):
+    """Submit a search_service.search call to the shared executor with a timeout,
+    logging under `label`. Returns (results, None) on success or (None, error_response)."""
+    t_search_start = time.time()
+    app.logger.info(f"[{label}] Submitting search to executor...")
+    search_future = _executor.submit(search_service.search, embedding, k, filters)
+    try:
+        app.logger.info(f"[{label}] Waiting for search result (timeout={timeout}s)...")
+        results = search_future.result(timeout=timeout)
+        t_search_elapsed = time.time() - t_search_start
+        app.logger.info(f"[{label}] Search completed in {t_search_elapsed:.2f}s, returned {len(results.get('id', []))} results")
+        return results, None
+    except FuturesTimeoutError:
+        app.logger.error(f"[{label}] Search timed out after {time.time()-t_search_start:.2f}s")
+        return None, (jsonify({"error": f"Search timed out after {timeout}s. Try reducing k or check index optimization."}), 504)
+    except Exception as e:
+        app.logger.exception(f"[{label}] Search failed after {time.time()-t_search_start:.2f}s: {e}")
+        return None, (jsonify({"error": str(e)}), 500)
 
 
 @app.route('/process_query', methods=['POST'])
@@ -216,21 +243,10 @@ def process_query():
         return jsonify({"error": str(e)}), 500
 
     # Perform search (possibly filtered) — also run in thread with timeout
-    try:
-        t_search_start = time.time()
-        app.logger.info("[process_query] Submitting search to executor...")
-        search_future = _executor.submit(search_service.search, question_embedding, k, filters)
-        app.logger.info("[process_query] Waiting for search result (timeout=120s)...")
-        results = search_future.result(timeout=120)
-        t_search_elapsed = time.time() - t_search_start
-        app.logger.info(f"[process_query] Search completed in {t_search_elapsed:.2f}s, returned {len(results.get('id', []))} results")
-    except FuturesTimeoutError:
-        app.logger.error(f"[process_query] Search timed out after {time.time()-t_search_start:.2f}s")
-        return jsonify({"error": "Search timed out after 120s. Try reducing k or check index optimization."}), 504
-    except Exception as e:
-        app.logger.exception(f"[process_query] Search failed after {time.time()-t_search_start:.2f}s: {e}")
-        return jsonify({"error": str(e)}), 500
-    
+    results, err = _run_search(question_embedding, k, filters, "process_query")
+    if err is not None:
+        return err
+
     t_total = time.time() - t_start
     app.logger.info(f"[process_query] COMPLETE - Total time: {t_total:.2f}s")
     
@@ -247,10 +263,44 @@ def process_query():
         img_names=safe_results['file_name'],
         retrieval_scores=safe_results['scores'],
         species=safe_results['species'],
+        # E51: the per-photo identity. `species` above is a dev-only fallback that is empty in
+        # production; these three are the real thing, resolved server-side against
+        # final_taxa_with_names.csv. The review grid shows them at the moment of judgement.
+        taxon_ids=safe_results.get('taxon_id'),
+        taxon_names=safe_results.get('taxon_name'),
+        taxon_commons=safe_results.get('taxon_common'),
         latitudes=safe_results['latitudes'],
         longitudes=safe_results['longitudes'],
         months=safe_results['months'],
+        licenses=safe_results['licenses'],
+        # E37 Phase 5: what actually served this request, so the caller can log it per draw.
+        filter_mode=safe_results.get('filter_mode'),
+        filter_pool_size=safe_results.get('filter_pool_size'),
+        nprobe_used=safe_results.get('nprobe'),
     )
+
+
+@app.route('/search_vec', methods=['POST'])
+def search_vec():
+    """Image->image (or raw-embedding) search: bypass text encoding and query the 290M index
+    directly with a precomputed, L2-normalized SigLIP embedding. Enables query-by-example /
+    pseudo-relevance feedback over the index (EXPERIMENTS 3.20 two-stage retrieval).
+    Body: {"query_vec": [...] (D,) or (1,D), "k": int, "filters": {...}}."""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        vec = np.asarray(data["query_vec"], dtype=np.float32)
+        if vec.ndim == 1:
+            vec = vec[None, :]
+        k = int(data.get("k", 100))
+        filters = data.get("filters", {}) or {}
+    except Exception as e:
+        return jsonify({"error": f"bad payload: {e}"}), 400
+    results, err = _run_search(vec, k, filters, "search_vec")
+    if err is not None:
+        return err
+    safe = make_serializable(results)
+    return jsonify(img_ids=safe['id'], img_urls=safe['img_url'],
+                   retrieval_scores=safe['scores'], species=safe.get('species', []))
 
 
 @app.route("/api/autocomplete", methods=["GET"])
@@ -455,5 +505,8 @@ if __name__ == '__main__':
         print(k, '=', v)
 
     from waitress import serve
-    print("Running on port 5002...")
-    serve(app, host="0.0.0.0", port=5002)
+    # Port is configurable via BACKEND_PORT (default 5002) so the same app can be
+    # served on any unprivileged port for sharing. host=0.0.0.0 -> publicly reachable.
+    port = int(os.environ.get("BACKEND_PORT", 5002))
+    print(f"Running on port {port}...")
+    serve(app, host="0.0.0.0", port=port)

@@ -1,4 +1,9 @@
 
 *.pyc
 *.log
-__pycache__/*.pyc
+*/*.pyc
+.cache/huggingface/models--timm--ViT-B-16-SigLIP/blobs/cc26c82999019b181968187db28e9fbca53a5e52
+.cache/huggingface/models--timm--ViT-SO400M-14-SigLIP-384/snapshots/ac16108d567c4389e6cd2b11c9b8585f7474435b/open_clip_pytorch_model.bin
+.gitignore
+
+

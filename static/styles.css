@@ -197,6 +197,63 @@ img {
     gap: 1px;
     cursor: pointer;
     overflow: hidden; /* Ensures that the image doesn't overflow the container */
+    position: relative; /* anchor for the iNat caption overlay */
+}
+
+/* iNat photo id / link shown as a banner along the bottom of each result */
+.inat-caption {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 3px 6px;
+    text-align: center;
+}
+
+.inat-caption a {
+    color: #fff;
+    font-size: 12px;
+    font-family: monospace;
+    text-decoration: none;
+}
+
+.inat-caption a:hover {
+    text-decoration: underline;
+}
+
+.inat-license {
+    display: block;
+    color: #fff;
+    font-size: 11px;
+    font-family: monospace;
+}
+
+/* License filter panel in the search header */
+#license-filter-container {
+    margin-top: 8px;
+}
+
+#license-filter-toggle {
+    background: none;
+    border: none;
+    color: #fff;
+    cursor: pointer;
+    font-size: 13px;
+    padding: 0;
+}
+
+#license-filter-options {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 16px;
+    margin-top: 6px;
+}
+
+.license-option {
+    color: #fff;
+    font-size: 13px;
+    cursor: pointer;
 }
 
     /* Style for selected image */

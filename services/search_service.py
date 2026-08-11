@@ -41,7 +41,18 @@ class SearchService:
         except Exception as e:
             raise
         
+        # Per-image taxon id, mmap'd and length-aligned to the FAISS index (see
+        # backend/sanity_check_production.py) -- the working species source of truth.
+        # filename_to_species/metadata.csv below is a dev-only fallback that is empty
+        # in production (that CSV doesn't exist there), so species post-filtering must
+        # go through this array, not that dict.
         self.image_id_to_taxon_id = None
+        try:
+            taxon_id_path = getattr(Config, 'IMAGE_ID_TO_TAXON_ID_PATH', None)
+            if taxon_id_path and os.path.exists(taxon_id_path):
+                self.image_id_to_taxon_id = np.load(taxon_id_path, mmap_mode='r')
+        except Exception as e:
+            print(f"Error loading image_id_to_taxon_id: {e}")
 
         # Load species names from metadata CSV for populating search results
         self.photoid_to_filename = {}
@@ -106,6 +117,23 @@ class SearchService:
             print(f"Error loading geo index: {e}")
         self.month_index = np.load(Config.MONTH_INDEX_PATH, mmap_mode='r')
 
+        # Load license index + code map (see backend/build_license_index.py)
+        self.license_index = None
+        self.license_code_to_name = {}
+        self.license_name_to_code = {}
+        try:
+            license_path = getattr(Config, 'LICENSE_INDEX_PATH', None)
+            code_map_path = getattr(Config, 'LICENSE_CODE_MAP_PATH', None)
+            if license_path and os.path.exists(license_path):
+                self.license_index = np.load(license_path, mmap_mode='r')
+            if code_map_path and os.path.exists(code_map_path):
+                import json as _json
+                with open(code_map_path, 'r') as _f:
+                    self.license_code_to_name = {int(k): v for k, v in _json.load(_f).items()}
+                self.license_name_to_code = {v: k for k, v in self.license_code_to_name.items()}
+        except Exception as e:
+            print(f"Error loading license index: {e}")
+
         self.taxa_df = None
         self.species_name_to_taxon_id = {}
         try:
@@ -116,7 +144,12 @@ class SearchService:
                     self.species_name_to_taxon_id = _json.load(_f)
         except Exception as e:
             print(f"Error loading species name map: {e}")
-        
+
+        # _load_taxa was never called anywhere, so self.taxa_df stayed None and
+        # _process_taxon_filter's name lookup silently fell through -- load it here
+        # so species-name -> taxon_id resolution actually works.
+        self._load_taxa()
+
     def _load_taxa(self):
         try:
             self.taxa_df = pd.read_csv(Config.TAXA_DF_PATH)
@@ -139,21 +172,60 @@ class SearchService:
         except Exception:
             pass
 
-        # Species filter: Extract species name for post-filtering
+        # Species filter: resolve name(s)/id(s) to a set of target taxon ids. Two modes (knob
+        # `species_filter_mode`): 'in_index' (default) does a TRUE index-restricted search via the
+        # IDSelector (run_search_index._get_ids_in_species over the forward taxon mmap) -- ranking
+        # only within the species' own vectors, no top-k window cap; 'post_filter' does the older
+        # overfetch-then-filter (kept for A/B comparison). Matching on species NAME (the original
+        # approach) never worked in production -- the metadata.csv it needed doesn't exist there.
+        # A single species or a list (e.g. [predator, prey], for an OR match) are both accepted.
+        # For IVF, the IDSelector only sees vectors in PROBED cells, so `nprobe` is the real lever:
+        # more probes = more of the species' scattered vectors are reachable. Default is now 256
+        # (§3.33 operating point: plateau recall at nprobe=1 latency), not the old speed-only 1.
         t_filter_start = time.time()
-        species_filter_name = None
+        target_taxon_ids = set()
         taxon_id = None
+        filter_mode = filters.get('species_filter_mode', 'in_index')
         try:
-            species_filter_name = filters.get('species') or filters.get('species_name')
-            if species_filter_name:
-                print(f"[SearchService] Species filter will be applied post-search: '{species_filter_name}'", flush=True)
-                # Don't use taxon_id filtering in index due to data issue
-                taxon_id = None
+            nprobe = int(filters.get('nprobe', 256))
+        except Exception:
+            nprobe = 256
+        # E47: a species filter CAN match the species AND its subspecies. Send
+        # expand_descendants=true to get it; the default is exact-rank, which is what the deployed
+        # filter has always done.
+        #
+        # E48 set this default to FALSE, deliberately, reversing E47's `True`. Two reasons:
+        #   1. The randomized retrieval condition (BIAS_UNCERTAINTY.md §3.3) has a species-scope arm
+        #      of {none, foodweb}, and as of E48 it fires for the first time -- no logged draw before
+        #      2026-07-30 carries a condition. The UI never sends `expand_descendants`, so defaulting
+        #      it True would change what BOTH arms mean in the very restart that first produces any
+        #      observations. There would be no session in which the arm meant what E46 measured, and
+        #      the instrument would be contaminated from its first data point.
+        #   2. E46's predator+subspecies result (found@50 55 -> 60, ceiling 140 -> 153) was measured
+        #      on the 182-edge benchmark and was to be confirmed on a HELD-OUT split before shipping.
+        #      That confirmation has not been run.
+        # Expansion stays fully reachable per-request, so every A/B arm that wants it can ask.
+        expand_descendants = bool(filters.get('expand_descendants', False))
+        try:
+            raw_species = filters.get('species') or filters.get('species_name')
+            if raw_species:
+                values = raw_species if isinstance(raw_species, (list, tuple)) else [raw_species]
+                for v in values:
+                    tid = self._process_taxon_filter(v)
+                    if tid is not None:
+                        target_taxon_ids.add(int(tid))
+                if target_taxon_ids:
+                    print(f"[SearchService] Species filter ({filter_mode}, nprobe={nprobe}): "
+                          f"{raw_species} -> taxon ids {target_taxon_ids}", flush=True)
+                    if filter_mode == 'in_index':
+                        taxon_id = list(target_taxon_ids)   # pushed into the index IDSelector
+                else:
+                    print(f"[SearchService] Species filter '{raw_species}' resolved to no taxon id", flush=True)
         except Exception as e:
             print(f"[SearchService] ERROR in species filter processing: {e}", flush=True)
             import traceback
             traceback.print_exc()
-            species_filter_name = None
+            target_taxon_ids = set()
             taxon_id = None
 
         # Extract and process geo filter
@@ -161,38 +233,46 @@ class SearchService:
         
         # Extract and process month filter
         month_filter = self._process_month_filter(filters)
-        
+
+        # Extract and process license filter
+        license_filter = self._process_license_filter(filters)
+
         t_filter_elapsed = time.time() - t_filter_start
         print(f"[SearchService] Filter processing took {t_filter_elapsed:.3f}s")
-        
+
         # Debug logging
         try:
             print(f"[SearchService] processed taxon_id: {taxon_id}")
             print(f"[SearchService] processed geo_filter: {geo_filter}")
             print(f"[SearchService] processed month_filter: {month_filter}")
+            print(f"[SearchService] processed license_filter: {license_filter}")
         except Exception:
             pass
 
-        # Perform search (with species post-filtering if needed)
+        # Whether we'll post-filter results in Python (only for the 'post_filter' A/B mode; the
+        # 'in_index' mode filters inside the FAISS search itself so no post-filter is needed).
+        do_post_filter = bool(target_taxon_ids) and filter_mode == 'post_filter'
+
+        # Perform search
         t_search_start = time.time()
         try:
-            # If species filter is active, we need to retrieve more results
-            # and filter them afterwards (due to incorrect taxon mapping indices)
+            # Post-filter mode overfetches so enough survive the Python-side species match; the
+            # in-index mode already returns exactly the species' top-k, so no overfetch.
             search_k = k
-            if species_filter_name:
-                # Retrieve 10x results to ensure we get enough after filtering
+            if do_post_filter:
                 search_k = min(k * 10, 10000)
                 print(f"[SearchService] Retrieving {search_k} results for post-filtering to {k}", flush=True)
-            
+
             if Config.USE_SEARCH_SERVICE:
                 print("[SearchService] Calling external search service...")
                 distances, indices = self._call_external_search(
-                    question_embedding, search_k, taxon_id, geo_filter, month_filter
+                    question_embedding, search_k, taxon_id, geo_filter, month_filter, license_filter
                 )
             else:
                 print("[SearchService] Calling local search...")
                 distances, indices = self._call_local_search(
-                    question_embedding, search_k, taxon_id, geo_filter, month_filter
+                    question_embedding, search_k, taxon_id, geo_filter, month_filter, license_filter,
+                    nprobe=nprobe, expand_descendants=expand_descendants
                 )
         except Exception as e:
             print(f"[SearchService] ERROR in search execution: {e}", flush=True)
@@ -206,11 +286,18 @@ class SearchService:
         t_process_start = time.time()
         print("[SearchService] Processing search results...")
         results = self._process_search_results(distances, indices)
-        
-        # Apply species post-filter if needed
-        if species_filter_name and results['species']:
-            print(f"[SearchService] Applying species post-filter for '{species_filter_name}'", flush=True)
-            results = self._apply_species_post_filter(results, species_filter_name, k)
+
+        # Which path served this request, and how big the candidate pool was -- returned so a live
+        # draw can be logged with it (E37 Phase 5). None pool size means no filter was applied.
+        results['filter_mode'] = filter_mode if target_taxon_ids else 'none'
+        results['filter_pool_size'] = getattr(getattr(self, 'index', None),
+                                              'last_filter_pool_size', None)
+        results['nprobe'] = nprobe
+
+        # Apply species post-filter only in the post_filter A/B mode.
+        if do_post_filter and results.get('taxon_id'):
+            print(f"[SearchService] Applying species post-filter for taxon ids {target_taxon_ids}", flush=True)
+            results = self._apply_species_post_filter(results, target_taxon_ids, k)
             print(f"[SearchService] After filtering: {len(results['id'])} results", flush=True)
         
         t_process_elapsed = time.time() - t_process_start
@@ -220,18 +307,18 @@ class SearchService:
         print(f"[SearchService.search] COMPLETE - Total time: {t_total:.3f}s")
         return results
     
-    def _apply_species_post_filter(self, results, target_species, k):
-        """Filter search results to only include target species"""
-        # Find indices where species matches
+    def _apply_species_post_filter(self, results, target_taxon_ids, k):
+        """Filter search results to only include the given taxon id(s) (OR match)."""
+        # Find indices where the result's taxon id matches one of the targets
         matching_indices = []
-        for i, species in enumerate(results['species']):
-            if species == target_species:
+        for i, tid in enumerate(results['taxon_id']):
+            if tid in target_taxon_ids:
                 matching_indices.append(i)
                 if len(matching_indices) >= k:
                     break
-        
+
         if not matching_indices:
-            print(f"[SearchService] WARNING: No results found for species '{target_species}'", flush=True)
+            print(f"[SearchService] WARNING: No results found for taxon ids {target_taxon_ids}", flush=True)
             # Return empty results
             return {
                 'id': [],
@@ -239,11 +326,13 @@ class SearchService:
                 'file_name': [],
                 'scores': [],
                 'species': [],
+                'taxon_id': [],
                 'latitudes': [],
                 'longitudes': [],
                 'months': [],
+                'licenses': [],
             }
-        
+
         # Filter all result arrays to only include matching indices
         filtered_results = {}
         for key in results.keys():
@@ -309,26 +398,42 @@ class SearchService:
         """Process month filters"""
         if not filters.get('months', False):
             return None
-            
+
         months = filters.get('months')
         if not months or len(months) == 0:
             return None
-            
+
         return [int(month) for month in months]
+
+    def _process_license_filter(self, filters):
+        """Process license filters (e.g. filters['licenses'] = ['CC0', 'CC-BY'])"""
+        if not filters.get('licenses', False):
+            return None
+
+        licenses = filters.get('licenses')
+        if not licenses or len(licenses) == 0:
+            return None
+
+        codes = [self.license_name_to_code[name] for name in licenses if name in self.license_name_to_code]
+        if not codes:
+            print(f"[SearchService] No known license codes for requested licenses: {licenses}", flush=True)
+            return None
+        return codes
     
     def _decode_lat_lon(self, lat_enc, lon_enc):
         lat = (lat_enc / 100.0) - 90.0
         lon = (lon_enc / 100.0) - 180.0
         return (lat, lon)
         
-    def _call_external_search(self, query_vec, k, taxon_id, geo_filter, month_filter):
+    def _call_external_search(self, query_vec, k, taxon_id, geo_filter, month_filter, license_filter=None):
         """Call external search service"""
         payload = {
             "query_vec": query_vec.tolist(),
             "k": k,
             "taxon_id": taxon_id,
             "geo_filter": geo_filter,
-            "month_filter": month_filter
+            "month_filter": month_filter,
+            "license_filter": license_filter
         }
         try:
             # Short timeout so frontend doesn't hang if external service is down
@@ -337,7 +442,7 @@ class SearchService:
             print(f"Error calling search service (request failed): {e}")
             # Fallback to local index search
             try:
-                return self._call_local_search(query_vec, k, taxon_id, geo_filter, month_filter)
+                return self._call_local_search(query_vec, k, taxon_id, geo_filter, month_filter, license_filter)
             except Exception as le:
                 print(f"Local fallback also failed: {le}")
                 return np.array([[0]]), np.array([[-1]])
@@ -346,7 +451,7 @@ class SearchService:
         if resp.status_code != 200:
             print(f"Search service returned status {resp.status_code}: {resp.text}")
             try:
-                return self._call_local_search(query_vec, k, taxon_id, geo_filter, month_filter)
+                return self._call_local_search(query_vec, k, taxon_id, geo_filter, month_filter, license_filter)
             except Exception as le:
                 print(f"Local fallback also failed: {le}")
                 return np.array([[0]]), np.array([[-1]])
@@ -357,15 +462,15 @@ class SearchService:
             # resp.text may be empty or not JSON; include it in logs for debugging
             print(f"Error calling search service: response not JSON. Body:\n{resp.text}")
             try:
-                return self._call_local_search(query_vec, k, taxon_id, geo_filter, month_filter)
+                return self._call_local_search(query_vec, k, taxon_id, geo_filter, month_filter, license_filter)
             except Exception as le:
                 print(f"Local fallback also failed: {le}")
                 return np.array([[0]]), np.array([[-1]])
 
         # Successful parse
         return np.array(data.get("distances", [[0]])), np.array(data.get("indices", [[-1]]))
-            
-    def _call_local_search(self, query_vec, k, taxon_id, geo_filter, month_filter):
+
+    def _call_local_search(self, query_vec, k, taxon_id, geo_filter, month_filter, license_filter=None, nprobe=256, expand_descendants=False):
         """Use local search index"""
         import time
         t_start = time.time()
@@ -400,14 +505,17 @@ class SearchService:
             print("[SearchService._call_local_search] Using cached index", flush=True)
         
         t_query_start = time.time()
-        print(f"[SearchService._call_local_search] Calling index.search_with_filters(k={k}, taxon_id={taxon_id}, geo_filter={geo_filter}, months={month_filter})...", flush=True)
+        print(f"[SearchService._call_local_search] Calling index.search_with_filters(k={k}, taxon_id={taxon_id}, geo_filter={geo_filter}, months={month_filter}, licenses={license_filter})...", flush=True)
         import sys
         sys.stdout.flush()
         result = self.index.search_with_filters(
-            query_vec, k=k, 
-            taxon_id=taxon_id, 
-            geo_filter=geo_filter, 
-            months=month_filter
+            query_vec, k=k,
+            taxon_id=taxon_id,
+            geo_filter=geo_filter,
+            months=month_filter,
+            licenses=license_filter,
+            nprobe=nprobe,
+            expand_descendants=expand_descendants
         )
         t_query_elapsed = time.time() - t_query_start
         print(f"[SearchService._call_local_search] Index query took {t_query_elapsed:.3f}s", flush=True)
@@ -421,7 +529,43 @@ class SearchService:
         """Process search results into response format"""
         scores = distances[0]
         image_ids = [i for i in indices[0] if i != -1]
-        
+
+        # Per-image taxon id (image_id_to_taxon_id.npy, mmap'd, aligned to FAISS row) --
+        # the working species source of truth, used by the species post-filter.
+        if self.image_id_to_taxon_id is not None:
+            taxon_ids = [int(self.image_id_to_taxon_id[i]) for i in image_ids]
+        else:
+            taxon_ids = [None] * len(image_ids)
+
+        # E51: resolve those ids to names HERE, so the caller does not need a second lookup and
+        # cannot invent its own resolution. This uses `taxa_df` -- Config.TAXA_DF_PATH, i.e.
+        # final_taxa_with_names.csv, indexed by taxon_id -- which is the SAME table the species
+        # filter resolves against (_process_taxon_filter). An exact id lookup, never a fuzzy name
+        # search: the iNat /v1/taxa?q= endpoint is what showed a duck for "Wolverine" in the
+        # annotation tool, and it fails silently rather than returning nothing.
+        #
+        # This is the field the review grid needs. Until now it was computed on every request and
+        # then dropped at the jsonify boundary in app.py, while the `species` field that WAS
+        # exposed came from a dev-only metadata.csv fallback that does not exist in production and
+        # was therefore empty on every live request.
+        taxon_names, taxon_commons = [None] * len(taxon_ids), [None] * len(taxon_ids)
+        try:
+            if self.taxa_df is not None and not self.taxa_df.empty:
+                want = [t for t in taxon_ids if t is not None]
+                if want:
+                    sub = self.taxa_df.reindex(want)          # vectorised, index IS taxon_id
+                    name_by = dict(zip(sub.index, sub['name'])) if 'name' in sub else {}
+                    common_by = (dict(zip(sub.index, sub['common_name']))
+                                 if 'common_name' in sub else {})
+                    def _clean(v):
+                        return None if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+                    taxon_names = [_clean(name_by.get(t)) if t is not None else None
+                                   for t in taxon_ids]
+                    taxon_commons = [_clean(common_by.get(t)) if t is not None else None
+                                     for t in taxon_ids]
+        except Exception as e:
+            print(f"[SearchService] taxon name resolution failed: {e}", flush=True)
+
         # Get photo IDs from metadata
         # `MemoryMappedMetadataProvider.get` returns a numpy.record-like item
         # where the first field is the photo_id. That value can be bytes or a
@@ -535,6 +679,12 @@ class SearchService:
         else:
             months = [None] * len(photo_ids)
 
+        if self.license_index is not None and len(image_ids) > 0:
+            license_codes = self.license_index[image_ids]
+            licenses = [self.license_code_to_name.get(int(c)) for c in license_codes]
+        else:
+            licenses = [None] * len(photo_ids)
+
         # Convert photo_ids to appropriate format
         # Note: photo_ids are file paths, not numeric IDs in this dataset
         converted_ids = []
@@ -551,9 +701,13 @@ class SearchService:
             'file_name': file_names,
             'scores': scores.tolist(),
             'species': species_names,
+            'taxon_id': taxon_ids,
+            'taxon_name': taxon_names,        # scientific, from final_taxa_with_names.csv (E51)
+            'taxon_common': taxon_commons,    # common name, same table, same exact id lookup
             'latitudes': latitudes,
             'longitudes': longitudes,
             'months': months,
+            'licenses': licenses,
         }
 
     def to_url(self, photo_id, extension="jpg"):
