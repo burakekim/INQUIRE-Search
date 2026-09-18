@@ -29,7 +29,6 @@ import psutil
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from flask import Flask, render_template, request, jsonify, session, redirect
-from dotenv import dotenv_values
 
 import torch
 from all_clip import load_clip
@@ -500,10 +499,6 @@ def post_login():
 
 
 if __name__ == '__main__':
-    # Print environment variables to console
-    for k, v in dotenv_values('.env').items():
-        print(k, '=', v)
-
     from waitress import serve
     # Port is configurable via BACKEND_PORT (default 5002) so the same app can be
     # served on any unprivileged port for sharing. host=0.0.0.0 -> publicly reachable.
