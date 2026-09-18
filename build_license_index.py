@@ -29,7 +29,7 @@ DTYPE = np.dtype([
     ('height', np.int32),
 ])
 
-OUT_DIR = Path("/data/vision/beery/scratch/burake/searchin/data/inat_data")
+OUT_DIR = Path("/data/vision/beery/scratch/burake/searchin/data/inputs/inat_data")
 OUT_ARRAY = OUT_DIR / "image_id_to_license.npy"
 OUT_CODEMAP = OUT_DIR / "license_code_to_name.json"
 

@@ -37,8 +37,8 @@ class Config:
 
         # Built via backend/build_license_index.py (see that file for why the
         # chunk-concatenation order matters for alignment with FAISS ids).
-        LICENSE_INDEX_PATH = "/data/vision/beery/scratch/burake/searchin/data/inat_data/image_id_to_license.npy"
-        LICENSE_CODE_MAP_PATH = "/data/vision/beery/scratch/burake/searchin/data/inat_data/license_code_to_name.json"
+        LICENSE_INDEX_PATH = "/data/vision/beery/scratch/burake/searchin/data/inputs/inat_data/image_id_to_license.npy"
+        LICENSE_CODE_MAP_PATH = "/data/vision/beery/scratch/burake/searchin/data/inputs/inat_data/license_code_to_name.json"
    
     else:
         # Sandbox / Development Paths (Keep your old fallback here)

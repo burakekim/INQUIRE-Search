@@ -40,7 +40,7 @@ class EnhancedSearchIndex:
         # write `target_idx.hnsw.efSearch = 8` on the IndexIVFPQ, which has no `.hnsw` at all, so
         # the guard was never true and the assignment never happened -- the value stored in the
         # index file (1034) was what ran. Measured before changing anything
-        # (ablations/E48_efsearch.py, 264 benchmark queries, cell recall against the exact top-256
+        # (exps/archive/E48_efsearch.py, 264 benchmark queries, cell recall against the exact top-256
         # centroids by brute force):
         #
         #     efSearch     cells returned (asked 256)   cell recall@256   coarse ms/query
