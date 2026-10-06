@@ -27,7 +27,11 @@ class Config:
         
         METADATA_PATH = os.path.join(DATA_PATH, "embs", METADATA_NAME, "metadata")
         MAPPINGS_DIR = os.path.join(DATA_PATH, "notebooks")
-        PHOTO_ID_TO_EXT_MAP_PATH = os.path.join(MAPPINGS_DIR, "photo_id_to_ext_siglip_so400m.npy") 
+        PHOTO_ID_TO_EXT_MAP_PATH = os.path.join(MAPPINGS_DIR, "photo_id_to_ext_siglip_so400m.npy")
+        # The same map as two sorted arrays (~0.8G in RAM instead of a ~40G Python dict); used when
+        # present. Built 2026-10-02 by streaming the pickle above: 289,551,709 ids, the 158.6M
+        # non-'jpg' ones stored, every other id is 'jpg'.
+        PHOTO_ID_TO_EXT_COMPACT_PATH = "/data/vision/beery/scratch/burake/searchin/data/derived/photo_id_to_ext_compact.npz"
         IMAGE_ID_TO_TAXON_ID_PATH = os.path.join(MAPPINGS_DIR, "image_id_to_taxon_id.npy")
         TAXA_DF_PATH = os.path.join(MAPPINGS_DIR, "final_taxa_with_names.csv")
         GEO_INDEX_PATH = os.path.join(MAPPINGS_DIR, 'image_id_to_latlong_int.npy')

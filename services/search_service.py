@@ -5,6 +5,32 @@ from config import Config
 from utils import MemoryMappedMetadataProvider, EmbeddingProvider
 import pandas as pd
 
+
+class CompactExtMap:
+    """photo_id -> extension from sorted arrays, standing in for the pickled dict. Only non-'jpg' ids
+    are stored, so any other integer id is 'jpg' -- the same answer the lookup in SearchService gives
+    for an id the dict lacks. Its keys were all ints, so string keys are never 'in' it, as before."""
+
+    def __init__(self, path):
+        d = np.load(path)
+        self.ids, self.codes, self.names = d['ids'], d['codes'], d['names'].tolist()
+
+    def __contains__(self, pid):
+        return isinstance(pid, (int, np.integer))
+
+    def __getitem__(self, pid):
+        pid = int(pid)
+        if not 0 <= pid <= np.iinfo(self.ids.dtype).max:
+            return 'jpg'
+        # Query in the array's own dtype: a Python int makes searchsorted copy all 158M ids (232 ms
+        # a lookup, against 0.01 ms).
+        q = self.ids.dtype.type(pid)
+        i = int(np.searchsorted(self.ids, q))
+        if i < len(self.ids) and self.ids[i] == q:
+            return self.names[self.codes[i]]
+        return 'jpg'
+
+
 class SearchService:
     def __init__(self):
         # Safely check if the embedding path exists and is not None before loading
@@ -26,7 +52,10 @@ class SearchService:
                 json_candidate = Config.PHOTO_ID_TO_EXT_MAP_PATH[:-4] + '.json'
                 if os.path.exists(json_candidate):
                     json_path = json_candidate
-            if json_path and os.path.exists(json_path):
+            compact_path = getattr(Config, 'PHOTO_ID_TO_EXT_COMPACT_PATH', None)
+            if compact_path and os.path.exists(compact_path):
+                self.photo_id_to_ext_map = CompactExtMap(compact_path)
+            elif json_path and os.path.exists(json_path):
                 import json as _json
                 with open(json_path, 'r') as _f:
                     self.photo_id_to_ext_map = _json.load(_f)

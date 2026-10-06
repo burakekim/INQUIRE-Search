@@ -21,6 +21,7 @@ except Exception:
     pass
 
 from functools import wraps
+import ipaddress
 import json
 import logging
 import time
@@ -125,6 +126,30 @@ def print_elapsed_time(func):
         app.logger.info("\t%s ms for function %s" % (time_in_ms, func.__name__))
         return result
     return time_wrapper
+
+
+# With LOGIN_REQUIRED=true (set on the public VM, 2026-10-06), every route but the login pages needs
+# the key, except from inside CSAIL: the search page's own API calls carry the session cookie, while
+# the loop UI and scripts call /process_query from CSAIL without one. A TCP forwarder inside CSAIL
+# (like the old bobolink proxy) would therefore let everything through.
+_NO_KEY_NEEDED = [ipaddress.ip_network(n) for n in ("127.0.0.0/8", "128.30.0.0/16", "128.52.0.0/16")]
+
+
+@app.before_request
+def require_login():
+    if not Config.LOGIN_REQUIRED or session.get('logged_in'):
+        return None
+    if request.endpoint in ('home', 'login', 'login_request', 'get_login', 'post_login', 'static'):
+        return None
+    # Behind the VM's Caddy front door every request arrives from 127.0.0.1, so take the visitor's
+    # address from the X-Forwarded-For that Caddy sets. Only trusted when the request comes from
+    # localhost: a header sent straight to :5002 from outside is ignored.
+    ip = request.remote_addr
+    if ip == '127.0.0.1' and request.headers.get('X-Forwarded-For'):
+        ip = request.headers['X-Forwarded-For'].split(',')[-1].strip()
+    if any(ipaddress.ip_address(ip) in n for n in _NO_KEY_NEEDED):
+        return None
+    return jsonify({'error': 'login required'}), 401
 
 
 @app.route('/')
