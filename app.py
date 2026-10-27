@@ -301,6 +301,7 @@ def process_query():
         filter_mode=safe_results.get('filter_mode'),
         filter_pool_size=safe_results.get('filter_pool_size'),
         nprobe_used=safe_results.get('nprobe'),
+        nprobe_requested=safe_results.get('nprobe_requested'),   # E216: differs when the search escalated
     )
 
 

@@ -6,6 +6,12 @@ from utils import MemoryMappedMetadataProvider, EmbeddingProvider
 import pandas as pd
 
 
+
+# E216: cells to retry a short filtered search with, in order (see SearchService.search).
+NPROBE_LADDER = (1024, 4096)
+# E216: extra rows fetched so that rows repeating a photograph can be dropped and k unique remain.
+DEDUP_MARGIN = 5
+
 class CompactExtMap:
     """photo_id -> extension from sorted arrays, standing in for the pickled dict. Only non-'jpg' ids
     are stored, so any other integer id is 'jpg' -- the same answer the lookup in SearchService gives
@@ -291,6 +297,8 @@ class SearchService:
             if do_post_filter:
                 search_k = min(k * 10, 10000)
                 print(f"[SearchService] Retrieving {search_k} results for post-filtering to {k}", flush=True)
+            else:
+                search_k = k + DEDUP_MARGIN     # E216: room to drop rows that repeat a photograph
 
             if Config.USE_SEARCH_SERVICE:
                 print("[SearchService] Calling external search service...")
@@ -308,6 +316,30 @@ class SearchService:
             import traceback
             traceback.print_exc()
             raise
+        # E216: a filtered IVF search only sees the species' vectors inside the PROBED cells, so a
+        # predator whose photographs all sit outside the `nprobe` cells nearest the query comes back
+        # short or empty (4.5% of 3,750 live draws returned nothing at nprobe=256, among them pools of
+        # 36,000 photographs). When a filtered search returns fewer than it could, retry it with more
+        # cells, one step of NPROBE_LADDER at a time. Unfiltered searches and full replies never retry.
+        # A request can opt out with filters['nprobe_escalation'] = false.
+        nprobe_requested = nprobe
+        keep = None if do_post_filter else k
+        distances, indices = self._dedupe_rows(distances, indices, keep)
+        escalate = str(filters.get('nprobe_escalation', True)).lower() not in ('false', '0', 'no')
+        if taxon_id is not None and escalate and not Config.USE_SEARCH_SERVICE:
+            for nprobe_next in NPROBE_LADDER:
+                n_found = int((indices[0] != -1).sum())
+                pool = getattr(getattr(self, 'index', None), 'last_filter_pool_size', None) or 0
+                if n_found >= min(k, pool) or nprobe_next <= nprobe:
+                    break
+                print(f"[SearchService] Filtered search returned {n_found} of {k} (pool {pool}) at "
+                      f"nprobe={nprobe}; retrying at nprobe={nprobe_next}", flush=True)
+                nprobe = nprobe_next
+                distances, indices = self._call_local_search(
+                    question_embedding, search_k, taxon_id, geo_filter, month_filter, license_filter,
+                    nprobe=nprobe, expand_descendants=expand_descendants
+                )
+                distances, indices = self._dedupe_rows(distances, indices, keep)
         t_search_elapsed = time.time() - t_search_start
         print(f"[SearchService] Core search took {t_search_elapsed:.3f}s")
 
@@ -321,7 +353,8 @@ class SearchService:
         results['filter_mode'] = filter_mode if target_taxon_ids else 'none'
         results['filter_pool_size'] = getattr(getattr(self, 'index', None),
                                               'last_filter_pool_size', None)
-        results['nprobe'] = nprobe
+        results['nprobe'] = nprobe                      # the nprobe that produced these results
+        results['nprobe_requested'] = nprobe_requested
 
         # Apply species post-filter only in the post_filter A/B mode.
         if do_post_filter and results.get('taxon_id'):
@@ -336,6 +369,24 @@ class SearchService:
         print(f"[SearchService.search] COMPLETE - Total time: {t_total:.3f}s")
         return results
     
+    def _dedupe_rows(self, distances, indices, k=None):
+        """E216: drop FAISS rows whose photograph repeats an earlier row's, keeping rank order, then cut
+        to k. The index holds some photographs under two rows (identical vector, identical score), and
+        5.4% of 3,568 live replies showed one photograph twice in the same top ten."""
+        keep, seen = [], set()
+        for j, row in enumerate(indices[0]):
+            if row == -1:
+                continue
+            pid = self.meta.get(int(row))[0]
+            pid = pid.decode('utf-8') if isinstance(pid, (bytes, np.bytes_)) else str(pid)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            keep.append(j)
+            if k is not None and len(keep) == k:
+                break
+        return distances[:, keep], indices[:, keep]
+
     def _apply_species_post_filter(self, results, target_taxon_ids, k):
         """Filter search results to only include the given taxon id(s) (OR match)."""
         # Find indices where the result's taxon id matches one of the targets
